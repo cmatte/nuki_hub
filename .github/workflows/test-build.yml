@@ -1,0 +1,141 @@
+name: Test build (version below the next release)
+# Our own test images. Each one reports "<last upstream release>.1" (for example 9.19.1),
+# so Home Assistant's Nuki Hub update entity still offers the next official release.
+#   gh workflow run test-build.yml --repo cmatte/nuki_hub --ref test-build \
+#     -f repository=technyon/nuki_hub -f ref=master -f boards='["esp32-s3"]'
+# The build steps are copied from upstream build.yml. Re-copy them if upstream changes its toolchain.
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Repository to build (owner/name)"
+        default: "cmatte/nuki_hub"
+      ref:
+        description: "Branch, tag or SHA to build"
+        default: "master"
+      boards:
+        description: "JSON list of boards"
+        default: '["esp32", "esp32-nopsram", "esp32-s3", "esp32-s3-nopsram", "esp32-s3-oct", "esp32-c3", "esp32-c5", "esp32-c6", "esp32-c61", "esp32-h2", "esp32-solo1", "esp32-gl-s10", "esp32-p4", "esp32-p4-v3", "esp32-p4c5", "esp32-p4c5-v3"]'
+      version:
+        description: "Override the version (x.y.z). Leave empty for <last release>.1"
+        default: ""
+  push:
+    branches: [test-build]
+    paths: [.github/workflows/test-build.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.board }} (${{ matrix.build }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board: ${{ fromJSON(inputs.boards || '["esp32-s3"]') }}
+        build: [release]
+    env:
+      BOARD: ${{ matrix.board }}
+      VARIANT: ${{ matrix.name || matrix.board }}
+      BUILD: ${{ matrix.build }}
+    steps:
+      - name: Fix variant name
+        run: |
+          export VARIANT=${VARIANT//-/}
+          echo "VARIANT=${VARIANT}" | tee -a ${GITHUB_ENV}
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repository || 'technyon/nuki_hub' }}
+          ref: ${{ inputs.ref || 'master' }}
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+
+      - name: Install PlatformIO Core
+        run: |
+          uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+          uv pip install --system -U "littlefs-python>=0.16.0" "fatfs-ng>=0.1.14" "pyyaml>=6.0.2" \
+            "rich-click>=1.8.6" "zopfli>=0.2.2" "intelhex>=2.3.0" "rich>=14.0.0" "urllib3<2" \
+            "cryptography>=45.0.3" "certifi>=2025.8.3" "ecdsa>=0.19.1" "bitstring>=4.3.1" \
+            "reedsolo>=1.5.3,<1.8" "esp-idf-size>=2.0.0" "esp-coredump>=1.14.0"
+
+      - name: Stamp test version (below the next release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERRIDE: ${{ inputs.version }}
+          BUILDNR: ${{ github.run_id }}.${{ github.run_number }}.${{ github.run_attempt }}
+          SRC_REPO: ${{ inputs.repository || 'technyon/nuki_hub' }}
+          SRC_REF: ${{ inputs.ref || 'master' }}
+        run: |
+          set -euo pipefail
+          src=$(grep -oP '(?<=#define NUKI_HUB_VERSION ")[^"]*' src/Config.h)
+          if [ -n "$OVERRIDE" ]; then
+            v="$OVERRIDE"
+          else
+            # Use the newest official release that is not above the source's own number,
+            # because upstream master already carries the NEXT number (e.g. 9.20 after 9.19).
+            base=$(gh api --paginate repos/technyon/nuki_hub/releases \
+                     -q '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+              | python3 -c 'import sys
+          key = lambda s: tuple(int(x) for x in s.split("."))
+          src = key(sys.argv[1])
+          tags = [t.strip() for t in sys.stdin if t.strip().replace(".", "").isdigit()]
+          print(max((t for t in tags if key(t) <= src), key=key))' "$src")
+            v="${base}.1"
+          fi
+          # Home Assistant compares with AwesomeVersion: "9.19.1" sorts below "9.20".
+          # A suffix like "9.20-test" cannot be compared, and HA then always shows an update.
+          echo "$v" | grep -qP '^\d+\.\d+\.\d+$' || { echo "::error::version '$v' is not x.y.z"; exit 1; }
+          sed -i "s/^#define NUKI_HUB_VERSION \".*\"/#define NUKI_HUB_VERSION \"$v\"/" src/Config.h
+          sed -i "s/unknownbuildnr/$BUILDNR/g" src/Config.h
+          # NUKI_HUB_VERSION_INT stays as in the source: it drives the config migrations.
+          grep -q "#define NUKI_HUB_VERSION \"$v\"" src/Config.h
+          grep -n "NUKI_HUB_VERSION\|NUKI_HUB_BUILD" src/Config.h
+          echo "TEST_VERSION=$v" >> "$GITHUB_ENV"
+          echo "Source ${SRC_REPO}@${SRC_REF} (Config.h $src) → test version **$v**, build $BUILDNR" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build ${{ matrix.build }} PlatformIO Project ${{ matrix.board }}
+        run: |
+          ORIGBOARD="${BOARD}"
+          if [ "$BUILD" = "debug" ]; then
+            BOARD="${BOARD}_dbg"
+          fi
+          echo "::group::Building with PlatformIO"
+            make updater_${ORIGBOARD}
+            make $BOARD
+          echo "::endgroup::"
+
+      - name: Check the image carries the test version
+        run: |
+          bin=$(ls ${BUILD}/${VARIANT}/nuki_hub_*.bin | grep -v updater | head -1)
+          grep -c -a -F "$TEST_VERSION" "$bin"
+          echo "$bin contains $TEST_VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Add flash script
+        env:
+          DOC: resources/how-to-flash.txt
+          FILES: ${{ format('{0}/{1}', env.BUILD, env.VARIANT) }}
+        run: |
+          BOARD=`echo $BOARD | tr '[:lower:]' '[:upper:]'`
+          command=`sed -n '/^Howto flash (esptool)$/,$p' ${DOC} | sed -n '/^## '"${BOARD}"'$/,\${ n; n; p; }' | head -n1`
+          if [ -z "$command" ]; then
+            echo "::error::Command not found in document ${DOC} for board ${BOARD}"
+            exit 1
+          fi
+          echo "$command" | tee ${FILES}/flash.sh
+          chmod a+x ${FILES}/flash.sh
+
+      - name: Upload Artifact ${{ matrix.board }}-${{ matrix.build }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ format('{0}-{1}-{2}-assets', env.VARIANT, matrix.build, env.TEST_VERSION) }}
+          path: ${{ matrix.build }}/${{ env.VARIANT }}
