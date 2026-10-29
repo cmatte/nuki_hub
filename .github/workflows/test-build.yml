@@ -116,7 +116,7 @@ jobs:
 
       - name: Check the image carries the test version
         run: |
-          bin=$(ls ${BUILD}/${VARIANT}/nuki_hub_*.bin | grep -v updater | head -1)
+          bin=$(ls ${BUILD}/${VARIANT}/nuki_hub_*.bin | grep -vE "_(updater|bootloader|partitions)_" | head -1)
           grep -c -a -F "$TEST_VERSION" "$bin"
           echo "$bin contains $TEST_VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
 
